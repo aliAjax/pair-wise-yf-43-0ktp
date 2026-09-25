@@ -38,7 +38,7 @@ class FailureTest(unittest.TestCase):
                 Actor("admin", "admin"),
                 entity["id"],
                 'send_calibration',
-                {},
+                {'assignee': 'm-1', 'planned_finish_at': '2026-12-01', 'purpose': 'p'},
                 expected_version=999,
             )
 

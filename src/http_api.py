@@ -94,9 +94,14 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
+                    overdue = query.get("overdue", [None])[0]
+                    overdue = overdue is not None and overdue.lower() not in ("0", "false", "no")
+                    as_of = query.get("as_of", [None])[0]
                     return self._send(
                         200,
-                        {"items": service.list(parts[1], status=status)},
+                        {"items": service.list(
+                            parts[1], status=status, overdue=overdue, as_of=as_of
+                        )},
                     )
                 raise NotFoundError("not found")
             except Exception as exc:
@@ -116,7 +121,14 @@ def create_handler(service, rules, static_dir):
                     expected = body.pop("expected_version", None)
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], action, data, expected),
+                        service.transition(
+                            actor,
+                            parts[2],
+                            action,
+                            data,
+                            expected,
+                            idempotency_key=self.headers.get("Idempotency-Key"),
+                        ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
@@ -131,6 +143,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            idempotency_key=self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":

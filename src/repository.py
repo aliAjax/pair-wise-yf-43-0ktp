@@ -54,6 +54,14 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS action_idempotency (
+                    actor_id TEXT NOT NULL,
+                    idem_key TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(actor_id, idem_key)
+                );
             """)
 
     @staticmethod
@@ -140,6 +148,50 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def apply_changes(self, changes):
+        """在单个事务里按乐观锁更新多个实体，任一版本冲突则全部回滚。
+
+        change: {"id", "expected_version", "status", "data"}
+        """
+        now = utcnow()
+        prepared = [
+            (
+                change["id"],
+                change["expected_version"],
+                change["status"],
+                json.dumps(change["data"], ensure_ascii=False, sort_keys=True),
+                now,
+            )
+            for change in changes
+        ]
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for entity_id, expected_version, status, payload, stamp in prepared:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + entity_id)
+                current_version = int(row["version"])
+                if expected_version is not None and current_version != int(expected_version):
+                    raise ConflictError(
+                        "version conflict on %s: expected %s, found %s"
+                        % (entity_id, expected_version, current_version)
+                    )
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (status, payload, stamp, entity_id, current_version),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return [self.get_entity(change["id"]) for change in changes]
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
@@ -194,6 +246,30 @@ class SQLiteRepository:
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
+            )
+
+    def get_action_idempotency(self, actor_id, idem_key):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT entity_id, response FROM action_idempotency WHERE actor_id = ? AND idem_key = ?",
+                (actor_id, idem_key),
+            ).fetchone()
+        if not row:
+            return None
+        return {"entity_id": row["entity_id"], "response": json.loads(row["response"])}
+
+    def save_action_idempotency(self, actor_id, idem_key, entity_id, response):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO action_idempotency(actor_id, idem_key, entity_id, response, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    actor_id,
+                    idem_key,
+                    entity_id,
+                    json.dumps(response, ensure_ascii=False, sort_keys=True),
+                    utcnow(),
+                ),
             )
 
     def ping(self):

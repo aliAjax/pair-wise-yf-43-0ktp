@@ -29,13 +29,23 @@ python3 app.py --db ./data.db --port 8309
 ## 主要接口
 
 - `GET /health`：健康检查。
-- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤。
+- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤；校准工单另支持`?overdue=true`（可配`?as_of=YYYY-MM-DD`，默认今天）筛出已过计划完成日仍未回填的工单。
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
-- `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`；动作可带`Idempotency-Key`请求头，重复提交沿用首次响应且不重复写审计。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 送检与回填流程
+
+1. 计量员（metrology）对`active`仪器执行`send_calibration`，必须登记`assignee`（承担人）、`planned_finish_at`（计划完成日）和`purpose`（用途）。仪器随即进入`calibrating`（待校准），系统同时生成一张`requested`校准工单，仪器数据记录`calibration_id`。
+2. 校准结果未回填期间放行检测结果（result `release`）会被退回（400），错误信息携带待处理工单编号，检测结果保持`pending`。
+3. 待回填工单过了计划完成日即可通过`?overdue=true`筛出（计划日当天不算逾期）。
+4. 回填（calibration `perform`）：
+   - `result="passed"`必须带`due_at`（新到期日）；工单转为`passed`，仪器恢复`active`并写入新到期日。
+   - `result="failed"`必须带`disposition`（处置说明）；工单转为`failed`，仪器进入`quarantined`并保持停用，处置说明留在仪器数据中。
+5. 冲突与幂等：带旧`expected_version`提交时返回409，版本冲突在任何写入前判定，原状态与审计均不被覆盖；送检与回填在同一乐观锁事务里联动工单和仪器。同`Idempotency-Key`的重复提交直接返回首次记录。
 
 ## 测试
 

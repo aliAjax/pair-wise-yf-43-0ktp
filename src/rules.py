@@ -1,56 +1,142 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime
 
 from .domain import (
-    ConflictError,
     InvalidTransition,
     PermissionDenied,
     ValidationError,
 )
 
 
-def _validate_calibration(actor, data, lookup):
-    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
-    if not instrument:
-        raise ValidationError("instrument does not exist")
+def today():
+    return date.today().isoformat()
 
 
-def _validate_perform(actor, entity, data, lookup):
-    if data.get("result") not in ("passed", "failed"):
-        raise ValidationError("calibration result must be passed or failed")
-    if data.get("result") == "passed" and not data.get("due_at"):
-        raise ValidationError("passed calibration requires due_at")
+def _parse_date(value, field):
+    if not value:
+        raise ValidationError("missing required field: " + field)
+    try:
+        datetime.fromisoformat(str(value)[:10])
+    except ValueError:
+        raise ValidationError(field + " must be an ISO date (YYYY-MM-DD)")
 
 
 def calibration_current(due_at, as_of):
-    return str(due_at) >= str(as_of)
+    return str(due_at)[:10] >= str(as_of)[:10]
+
+
+def is_calibration_overdue(entity, as_of=None):
+    """送检工单仍处于待回填状态，且已过计划完成日（计划日当天不算逾期）。"""
+    as_of = as_of or today()
+    if entity.get("status") != "requested":
+        return False
+    planned = entity.get("data", {}).get("planned_finish_at")
+    if not planned:
+        return False
+    return _date_ordinal(planned) < _date_ordinal(as_of)
+
+
+def _open_calibration(instrument, lookup):
+    linked = instrument["data"].get("calibration_id")
+    if linked:
+        tickets = lookup("calibration", "id", linked) or []
+        if tickets and tickets[0]["status"] == "requested":
+            return tickets[0]
+    tickets = lookup("calibration", "instrument_id", instrument["id"]) or []
+    open_tickets = [ticket for ticket in tickets if ticket["status"] == "requested"]
+    return open_tickets[-1] if open_tickets else None
+
+
+def _validate_send(actor, entity, data, lookup):
+    _parse_date(data.get("planned_finish_at"), "planned_finish_at")
+    if data.get("requested_at"):
+        _parse_date(data.get("requested_at"), "requested_at")
+    return {}
+
+
+def _validate_perform(actor, entity, data, lookup):
+    result = data.get("result")
+    if result not in ("passed", "failed"):
+        raise ValidationError("calibration result must be passed or failed")
+    _parse_date(data.get("performed_at"), "performed_at")
+    instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    if not instrument:
+        raise ValidationError("instrument does not exist")
+    if instrument["status"] != "calibrating":
+        raise InvalidTransition("instrument is not awaiting calibration backfill")
+
+    patch = {"result": result, "performed_at": data.get("performed_at")}
+    # 送检期间仪器不应被他人改动：以工单登记的仪器版本为准
+    expected_instrument_version = entity["data"].get("instrument_version") or instrument["version"]
+    if result == "passed":
+        due_at = data.get("due_at")
+        if not due_at:
+            raise ValidationError("passed calibration requires due_at")
+        _parse_date(due_at, "due_at")
+        patch["due_at"] = due_at
+        side_effect = {
+            "id": instrument["id"],
+            "expected_version": expected_instrument_version,
+            "action": "calibrate",
+            "next_status": "active",
+            "patch": {"due_at": due_at},
+        }
+    else:
+        disposition = data.get("disposition")
+        if not disposition:
+            raise ValidationError("failed calibration requires disposition")
+        patch["disposition"] = disposition
+        side_effect = {
+            "id": instrument["id"],
+            "expected_version": expected_instrument_version,
+            "action": "quarantine",
+            "next_status": "quarantined",
+            "patch": {"disposition": disposition},
+        }
+    patch["__next_status__"] = result
+    patch["__side_effect__"] = side_effect
+    return patch
 
 
 def _validate_result_release(actor, entity, data, lookup):
     instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
     method = _find_one(lookup, "method", "id", data.get("method_id"))
-    if not instrument or instrument["status"] != "active":
-        raise ValidationError("result requires an active instrument")
-    if not calibration_current(instrument["data"].get("due_at", ""), "2026-09-24"):
-        raise ValidationError("instrument calibration is not current")
     if not method or method["status"] != "validated":
         raise ValidationError("result requires a validated method")
     if data.get("instrument_id") not in method["data"].get("instrument_ids", []):
         raise ValidationError("method is not validated for this instrument")
+    if not instrument:
+        raise ValidationError("result requires an instrument")
+    open_ticket = _open_calibration(instrument, lookup)
+    if open_ticket:
+        # 校准结果尚未回填：放行请求带工单编号退回
+        raise ValidationError(
+            "calibration result not backfilled; work order %s is pending"
+            % open_ticket["id"]
+        )
+    if instrument["status"] != "active":
+        raise ValidationError(
+            "instrument is out of service (status %s)" % instrument["status"]
+        )
+    if not calibration_current(instrument["data"].get("due_at", ""), today()):
+        raise ValidationError("instrument calibration is not current")
     return {"released_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'calibration': _validate_calibration}
-CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release}
+CUSTOM_TRANSITIONS = {
+    ("instrument", "send_calibration"): _validate_send,
+    ("calibration", "perform"): _validate_perform,
+    ("result", "release"): _validate_result_release,
+}
 
 
 class RuleEngine:
     ALIASES = {'instruments': 'instrument', 'calibrations': 'calibration', 'methods': 'method', 'results': 'result'}
     INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending'}
-    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
+    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active', 'calibrating'), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested',), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
     CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement')}
-    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
+    ACTION_REQUIRED = {('instrument', 'send_calibration'): ('assignee', 'planned_finish_at', 'purpose'), ('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
     CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
+    ROLE_ACTIONS = {'send_calibration': ('admin', 'metrology', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -79,9 +165,6 @@ class RuleEngine:
             raise ValidationError("unknown kind: " + str(kind))
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
-        custom = CUSTOM_CREATE.get(kind)
-        if custom:
-            custom(actor, data, lookup)
         return dict(data)
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
@@ -100,10 +183,11 @@ class RuleEngine:
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)
-        if extra:
-            patch.update(extra)
+        if custom:
+            patch.update(custom(actor, entity, data, lookup) or {})
+        # 合格/不合格由回填数据决定，允许自定义校验覆盖目标状态
+        next_status = patch.pop("__next_status__", next_status)
         return next_status, patch
 
 

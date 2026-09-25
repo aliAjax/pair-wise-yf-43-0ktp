@@ -32,7 +32,23 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_workflow(self):
         created = {}
-        steps = [{'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}}, {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration', 'data': {}, 'expect': 'calibrating'}, {'op': 'transition', 'target': 'instrument', 'action': 'calibrate', 'data': {'due_at': '2099-01-01', 'passed': True}, 'expect': 'active'}, {'op': 'create', 'as': 'calibration', 'kind': 'calibration', 'data': {'instrument_id': '{instrument}', 'requested_at': '2026-01-01'}}, {'op': 'transition', 'target': 'calibration', 'action': 'perform', 'data': {'result': 'passed', 'performed_at': '2026-01-02', 'uncertainty': 0.01, 'due_at': '2099-01-01'}, 'expect': 'passed'}, {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'}, {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}}, {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'}, {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}}, {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'}]
+        steps = [
+            {'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}},
+            # 计量员送检：登记承担人、计划完成日、用途，仪器随即待校准并生成工单
+            {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration',
+             'data': {'assignee': 'M-1', 'planned_finish_at': '2026-01-10', 'purpose': '年度送检', 'requested_at': '2026-01-01'},
+             'expect': 'calibrating'},
+            # 合格结果回填并填上新到期日，仪器恢复
+            {'op': 'lookup_ticket', 'as': 'calibration'},
+            {'op': 'transition', 'target': 'calibration', 'action': 'perform',
+             'data': {'result': 'passed', 'performed_at': '2026-01-08', 'due_at': '2099-01-01'},
+             'expect': 'passed'},
+            {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'},
+            {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}},
+            {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'},
+            {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}},
+            {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'},
+        ]
         for step in steps:
             if step["op"] == "create":
                 entity = self.service.create(
@@ -42,6 +58,10 @@ class WorkflowTest(unittest.TestCase):
                     step.get("idempotency_key"),
                 )
                 created[step["as"]] = entity["id"]
+            elif step["op"] == "lookup_ticket":
+                tickets = self.service.list("calibration")
+                self.assertEqual(len(tickets), 1)
+                created[step["as"]] = tickets[0]["id"]
             else:
                 entity = self.service.transition(
                     self.actor,
@@ -52,6 +72,12 @@ class WorkflowTest(unittest.TestCase):
                 )
             if "expect" in step:
                 self.assertEqual(entity["status"], step["expect"])
+
+        # 合格回填后仪器恢复可用，且带有新到期日
+        instrument = self.service.get(created["instrument"])
+        self.assertEqual(instrument["status"], "active")
+        self.assertEqual(instrument["data"]["due_at"], "2099-01-01")
+        self.assertNotIn("calibration_id", instrument["data"])
 
 
 if __name__ == "__main__":
