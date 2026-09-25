@@ -32,7 +32,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_workflow(self):
         created = {}
-        steps = [{'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}}, {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration', 'data': {}, 'expect': 'calibrating'}, {'op': 'transition', 'target': 'instrument', 'action': 'calibrate', 'data': {'due_at': '2099-01-01', 'passed': True}, 'expect': 'active'}, {'op': 'create', 'as': 'calibration', 'kind': 'calibration', 'data': {'instrument_id': '{instrument}', 'requested_at': '2026-01-01'}}, {'op': 'transition', 'target': 'calibration', 'action': 'perform', 'data': {'result': 'passed', 'performed_at': '2026-01-02', 'uncertainty': 0.01, 'due_at': '2099-01-01'}, 'expect': 'passed'}, {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'}, {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}}, {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'}, {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}}, {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'}]
+        steps = [{'op': 'create', 'as': 'instrument', 'kind': 'instrument', 'data': {'name': 'Analyzer', 'serial': 'A-1'}}, {'op': 'transition', 'target': 'instrument', 'action': 'send_calibration', 'data': {'assignee': 'M-7', 'planned_date': '2026-10-01', 'purpose': 'annual check'}, 'expect': 'calibrating'}, {'op': 'transition', 'target': 'calibration', 'action': 'perform', 'data': {'result': 'passed', 'performed_at': '2026-09-25', 'uncertainty': 0.01, 'due_at': '2099-01-01'}, 'expect': 'passed'}, {'op': 'transition', 'target': 'calibration', 'action': 'approve', 'data': {'authorized_by': 'QA-1'}, 'expect': 'approved'}, {'op': 'create', 'as': 'method', 'kind': 'method', 'data': {'name': 'Assay-A', 'version': 'v1'}}, {'op': 'transition', 'target': 'method', 'action': 'validate_method', 'data': {'parameters': {'range': [0, 10]}, 'instrument_ids': ['{instrument}']}, 'expect': 'validated'}, {'op': 'create', 'as': 'result', 'kind': 'result', 'data': {'sample_id': 'S-1', 'measurement': 'initial'}}, {'op': 'transition', 'target': 'result', 'action': 'release', 'data': {'instrument_id': '{instrument}', 'method_id': '{method}', 'value': 4.2, 'unit': 'mg/L'}, 'expect': 'released'}]
         for step in steps:
             if step["op"] == "create":
                 entity = self.service.create(
@@ -43,6 +43,16 @@ class WorkflowTest(unittest.TestCase):
                 )
                 created[step["as"]] = entity["id"]
             else:
+                if step["target"] == "calibration" and "calibration" not in created:
+                    orders = self.service.list("calibration")
+                    self.assertEqual(len(orders), 1)
+                    order = orders[0]
+                    self.assertEqual(order["status"], "requested")
+                    self.assertEqual(order["data"]["instrument_id"], created["instrument"])
+                    self.assertEqual(order["data"]["assignee"], "M-7")
+                    self.assertEqual(order["data"]["planned_date"], "2026-10-01")
+                    self.assertEqual(order["data"]["purpose"], "annual check")
+                    created["calibration"] = order["id"]
                 entity = self.service.transition(
                     self.actor,
                     created[step["target"]],
@@ -52,6 +62,10 @@ class WorkflowTest(unittest.TestCase):
                 )
             if "expect" in step:
                 self.assertEqual(entity["status"], step["expect"])
+            if step["op"] == "transition" and step["target"] == "calibration" and step["action"] == "perform":
+                instrument = self.service.get(created["instrument"])
+                self.assertEqual(instrument["status"], "active")
+                self.assertEqual(instrument["data"]["due_at"], "2099-01-01")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime
 
 from .domain import (
     ConflictError,
@@ -14,23 +14,67 @@ def _validate_calibration(actor, data, lookup):
         raise ValidationError("instrument does not exist")
 
 
+def _validate_send_calibration(actor, entity, data, lookup):
+    try:
+        _date_ordinal(data.get("planned_date"))
+    except (TypeError, ValueError):
+        raise ValidationError("planned_date must be an ISO date")
+
+
 def _validate_perform(actor, entity, data, lookup):
     if data.get("result") not in ("passed", "failed"):
         raise ValidationError("calibration result must be passed or failed")
     if data.get("result") == "passed" and not data.get("due_at"):
         raise ValidationError("passed calibration requires due_at")
+    if data.get("result") == "failed" and not data.get("disposition"):
+        raise ValidationError("failed calibration requires disposition")
+    return {"_status": data["result"]}
 
 
 def calibration_current(due_at, as_of):
     return str(due_at) >= str(as_of)
 
 
+def calibration_outcome(data):
+    """Instrument status and patch implied by a backfilled calibration result."""
+    if data.get("result") == "passed":
+        return "active", {"due_at": data.get("due_at")}
+    return "quarantined", {"disposition": data.get("disposition")}
+
+
+def work_order_overdue(entity, as_of=None):
+    """A work order is overdue when it has no result past its planned date."""
+    as_of = as_of or date.today().isoformat()
+    planned = entity["data"].get("planned_date")
+    return (
+        entity["status"] == "requested"
+        and bool(planned)
+        and str(planned) < str(as_of)
+    )
+
+
+def _open_work_orders(lookup, instrument_id):
+    if lookup is None:
+        return []
+    orders = lookup("calibration", "instrument_id", instrument_id) or []
+    return [order for order in orders if order["status"] == "requested"]
+
+
 def _validate_result_release(actor, entity, data, lookup):
     instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
     method = _find_one(lookup, "method", "id", data.get("method_id"))
-    if not instrument or instrument["status"] != "active":
+    if not instrument:
         raise ValidationError("result requires an active instrument")
-    if not calibration_current(instrument["data"].get("due_at", ""), "2026-09-24"):
+    pending = _open_work_orders(lookup, instrument["id"])
+    if pending:
+        raise ValidationError(
+            "calibration result not backfilled for work order " + pending[0]["id"]
+        )
+    if instrument["status"] != "active":
+        raise ValidationError("result requires an active instrument")
+    if not calibration_current(
+        instrument["data"].get("due_at", ""), date.today().isoformat()
+    ):
         raise ValidationError("instrument calibration is not current")
     if not method or method["status"] != "validated":
         raise ValidationError("result requires a validated method")
@@ -40,7 +84,7 @@ def _validate_result_release(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'calibration': _validate_calibration}
-CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release}
+CUSTOM_TRANSITIONS = {('instrument', 'send_calibration'): _validate_send_calibration, ('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release}
 
 
 class RuleEngine:
@@ -48,9 +92,9 @@ class RuleEngine:
     INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending'}
     TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
     CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement')}
-    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
+    ACTION_REQUIRED = {('instrument', 'send_calibration'): ('assignee', 'planned_date', 'purpose'), ('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
     CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
+    ROLE_ACTIONS = {'send_calibration': ('admin', 'metrology'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -100,7 +144,8 @@ class RuleEngine:
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
+        extra = dict(custom(actor, entity, data, lookup) or {}) if custom else {}
+        next_status = extra.pop("_status", next_status)
         patch = dict(data)
         if extra:
             patch.update(extra)
